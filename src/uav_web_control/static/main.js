@@ -42,3 +42,34 @@ document.addEventListener('click', function (e) {
     })
 }
 )
+
+
+// Poll status endpoint and update UI: disable buttons when drone not connected
+function updateStatusUI(statusData) {
+  Object.keys(statusData).forEach(key => {
+    const info = statusData[key]
+    const id = key // e.g. 'uav1'
+    const connected = info.connected
+    const flyBtn = document.querySelector(`.fly-btn[data-id="${id}"]`)
+    const armBtn = document.querySelector(`.arm-btn[data-id="${id}"]`)
+    const statusEl = document.getElementById('status-' + id)
+    const armStatusEl = document.getElementById('arm-status-' + id)
+    if (flyBtn) flyBtn.disabled = !connected
+    if (armBtn) armBtn.disabled = !connected
+    if (statusEl) statusEl.textContent = connected ? 'connected' : 'no node'
+    if (armStatusEl && armStatusEl.textContent === 'idle') armStatusEl.textContent = connected ? 'idle' : 'no node'
+  })
+}
+
+function pollStatus() {
+  fetch('/status').then(r => r.json()).then(data => {
+    if (data.status === 'ok' && data.data) {
+      updateStatusUI(data.data)
+    }
+  }).catch(err => console.error('status poll error', err))
+}
+
+// start polling every 2 seconds
+setInterval(pollStatus, 2000)
+// run once immediately
+pollStatus()

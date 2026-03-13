@@ -2,6 +2,7 @@ from flask import Flask, render_template, jsonify, request
 import yaml
 from pathlib import Path
 import logging
+import json
 
 # Import controller.fly_to with a fallback so the module can be run as
 # a script (python app.py) as well as imported as a package.
@@ -23,6 +24,9 @@ publishers = {}
 ros_node = None
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# Module reference to ros_control (if available)
+ros_control_mod = None
 
 
 def import_from_ros_control(attr_name):
@@ -57,24 +61,55 @@ def import_from_ros_control(attr_name):
 
     raise ImportError(f"Could not import {attr_name} from ros_control via any supported path")
 
+
+def import_ros_control_module():
+    """Import the ros_control module robustly and return the module object.
+
+    Tries package-style, absolute, and relative imports to support running
+    as `python -m uav_web_control.app` or `python app.py`.
+    """
+    # Try package-style import first
+    try:
+        return __import__('uav_web_control.ros_control', fromlist=['ros_control'])
+    except Exception:
+        pass
+
+    # Try plain module import
+    try:
+        return __import__('ros_control', fromlist=['ros_control'])
+    except Exception:
+        pass
+
+    # Try relative import if package context is available
+    try:
+        if __package__:
+            return __import__(f"{__package__}.ros_control", fromlist=['ros_control'])
+    except Exception:
+        pass
+
+    return None
+
 try:
     import rclpy
     # Prefer using the Python controller node mirroring px4_swarm_controller
     try:
-        # Use the robust helper to import ros_control attributes.
-        try:
-            start_controller = import_from_ros_control('start_controller')
-            arm_uav = import_from_ros_control('arm_uav')
-            fly_uav = import_from_ros_control('fly_uav')
-            log.info('Imported ros_control via import_from_ros_control')
-
-            # start_controller will init rclpy and spin the node
-            start_controller()
-            use_rclpy = True
-            log.info('rclpy available — using ros_control node for publishing')
-        except Exception:
-            log.exception('Failed to import ros_control via import_from_ros_control')
+        # Try to import the ros_control module and start its controller
+        ros_mod = import_ros_control_module()
+        if ros_mod is not None:
+            ros_control_mod = ros_mod
+            try:
+                ros_control_mod.start_controller()
+                use_rclpy = True
+                log.info('rclpy available — using ros_control node for publishing')
+            except Exception:
+                log.exception('Failed to start ros_control controller')
+                use_rclpy = False
+        else:
+            log.info('ros_control module not found; falling back')
             use_rclpy = False
+    except Exception as e:
+        log.exception('rclpy present but failed to start ros_control')
+        use_rclpy = False
     except Exception as e:
         log.exception('rclpy present but failed to start ros_control')
         use_rclpy = False
@@ -84,7 +119,20 @@ except Exception:
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
-CONFIG_PATH = Path(__file__).parent / 'config' / 'uavs.yaml'
+LOCAL_CONFIG_PATH = Path(__file__).parent / 'config' / 'uavs.yaml'
+# Try to prefer the px4_swarm_controller config if available in the workspace
+PX4_CONFIG_CANDIDATE = Path(__file__).resolve().parents[1] / 'px4_swarm_controller' / 'config' / 'config.yaml'
+
+# Path to last command log produced by controller stub
+LAST_CMD = Path(__file__).parent / 'last_command.json'
+
+# Remove last command file at startup to clear state
+try:
+    if LAST_CMD.exists():
+        LAST_CMD.unlink()
+        log.info('Cleared last command file: %s', LAST_CMD)
+except Exception:
+    pass
 
 
 def _uav_index(uav_id):
@@ -112,8 +160,36 @@ def _uav_index(uav_id):
 
 
 def load_uavs():
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, 'r') as f:
+    # If px4_swarm_controller config exists, use it to build UAV entries
+    try:
+        if PX4_CONFIG_CANDIDATE.exists():
+            cfg = yaml.safe_load(PX4_CONFIG_CANDIDATE.read_text()) or {}
+            uavs = {}
+            # initial_positions contains mapping of string id -> { initial_pose: { x, y } }
+            initial = cfg.get('initial_positions', {})
+            setpoints = cfg.get('setpoints', {})
+            for sid, val in initial.items():
+                idx = sid
+                pose = val.get('initial_pose', {})
+                x = float(pose.get('x', 0.0))
+                y = float(pose.get('y', 0.0))
+                # try to get altitude from first setpoint if present
+                z = None
+                if sid in setpoints and len(setpoints[sid]) > 0:
+                    try:
+                        z = float(setpoints[sid][0][2])
+                    except Exception:
+                        z = None
+                if z is None:
+                    z = -5.0
+                uavs[f'uav{idx}'] = {'name': f'Drone {idx}', 'position': [x, y, z]}
+            return uavs
+    except Exception:
+        log.exception('Failed to load px4_swarm_controller config')
+
+    # fallback to local config
+    if LOCAL_CONFIG_PATH.exists():
+        with open(LOCAL_CONFIG_PATH, 'r') as f:
             return yaml.safe_load(f) or {}
     return {}
 
@@ -136,20 +212,40 @@ def fly():
     idx = _uav_index(uav_id)
 
     # If rclpy and ros_control are available, use its API
-    if use_rclpy:
+    if use_rclpy and ros_control_mod is not None:
         try:
             # fly_uav expects numeric index and position
-            fly_uav = import_from_ros_control('fly_uav')
-            fly_uav(idx, target)
+            ros_control_mod.fly_uav(idx, target)
             return jsonify({'status': 'ok', 'message': f'fly command sent to {uav_id} (px4_{idx})'})
         except Exception as e:
             log.exception('ros_control.fly_uav failed')
             return jsonify({'status': 'error', 'message': str(e)}), 500
 
-    # Fallback: controller stub or ros2 CLI for environments without rclpy
+    # Fallback: try ros2 CLI (if available) to publish a TrajectorySetpoint,
+    # otherwise use the controller stub.
+    ros2 = shutil.which('ros2')
+    if ros2:
+        try:
+            # Build message with position array and yaw (if provided)
+            x, y, z = float(target[0]), float(target[1]), float(target[2])
+            yaw = float(target[3]) if len(target) > 3 else 0.0
+            msg_obj = {"position": [x, y, z], "yaw": yaw, "timestamp": 0}
+            msg = json.dumps(msg_obj)
+            topic = f"/px4_{idx}/fmu/in/trajectory_setpoint"
+            cmd = [ros2, 'topic', 'pub', '-1', topic, 'px4_msgs/msg/TrajectorySetpoint', msg]
+            log.info('Publishing TrajectorySetpoint via CLI: %s', ' '.join(cmd))
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if proc.returncode == 0:
+                return jsonify({'status': 'ok', 'message': f'fly command published to {topic}'})
+            else:
+                return jsonify({'status': 'error', 'message': proc.stderr or proc.stdout or proc.returncode}), 500
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    # Last-resort: controller stub writes last_command.json for debugging
     try:
         fly_to(uav_id, target)
-        return jsonify({'status': 'ok', 'message': f'command sent to {uav_id}'})
+        return jsonify({'status': 'ok', 'message': f'command saved for {uav_id} (no ros2 available)'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -173,10 +269,9 @@ def arm():
         return jsonify({'status': 'error', 'message': 'ros2 CLI not found in PATH. Run Flask in a ROS2-sourced environment.'}), 500
 
     # VEHICLE_CMD_COMPONENT_ARM_DISARM has numeric value 400
-    if use_rclpy:
+    if use_rclpy and ros_control_mod is not None:
         try:
-            arm_uav = import_from_ros_control('arm_uav')
-            arm_uav(idx)
+            ros_control_mod.arm_uav(idx)
             return jsonify({'status': 'ok', 'message': f'arm command sent to {uav_id} (px4_{idx})'})
         except Exception as e:
             log.exception('ros_control.arm_uav failed')
@@ -184,7 +279,22 @@ def arm():
 
     # Fallback to ros2 CLI if rclpy unavailable
     # Build a JSON-style message string (use double quotes) to avoid parsing issues
-    msg = '{"param1": 1.0, "param2": 0.0, "command": 400, "target_system": 1, "target_component": 1, "source_system": 1, "source_component": 1, "from_external": true, "timestamp": 0}'
+    try:
+        tnum = int(idx)
+    except Exception:
+        tnum = 1
+    msg_obj = {
+        "param1": 1.0,
+        "param2": 0.0,
+        "command": 400,
+        "target_system": tnum,
+        "target_component": 1,
+        "source_system": 1,
+        "source_component": 1,
+        "from_external": True,
+        "timestamp": 0,
+    }
+    msg = json.dumps(msg_obj)
 
     cmd = [ros2, 'topic', 'pub', '-1', topic, 'px4_msgs/msg/VehicleCommand', msg]
     log.info('Falling back to ros2 CLI: %s', ' '.join(cmd))
@@ -197,6 +307,24 @@ def arm():
             return jsonify({'status': 'error', 'message': proc.stderr or proc.stdout}), 500
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Return controller status for each UAV (connected / subscriber counts)."""
+    # If ros_control is available, ask it for status
+    if use_rclpy and ros_control_mod is not None:
+        try:
+            st = ros_control_mod._controller.get_uav_status() if hasattr(ros_control_mod, '_controller') else ros_control_mod.get_uav_status()
+            # convert keys to strings like 'uav1'
+            out = {f'uav{k}': v for k, v in st.items()}
+            return jsonify({'status': 'ok', 'data': out})
+        except Exception as e:
+            log.exception('Failed to get ros_control status')
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+
+    # Fallback: indicate no controller
+    return jsonify({'status': 'ok', 'data': {}, 'info': 'ros_control not available'})
 
 
 if __name__ == '__main__':
